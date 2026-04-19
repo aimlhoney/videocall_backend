@@ -4,16 +4,15 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model Room {
-  id          String   @id @default(cuid())
-  code        String   @unique
-  name        String
-  hostId      String
-  status      RoomStatus @default(WAITING)
-  createdAt   DateTime @default(now())
+  id           String        @id @default(cuid())
+  name         String
+  code         String        @unique
+  hostId       String
+  status       String        @default("WAITING")
+  createdAt    DateTime      @default(now())
   participants Participant[]
 }
 
@@ -29,9 +28,11 @@ model Participant {
   socketId  String?
 }
 
-
-enum RoomStatus {
-  WAITING
-  ACTIVE
-  ENDED
+model DailyStat {
+  id           String   @id @default(cuid())
+  date         String   @unique
+  rooms        Int      @default(0)
+  participants Int      @default(0)
+  visitors     Int      @default(0)
+  createdAt    DateTime @default(now())
 }

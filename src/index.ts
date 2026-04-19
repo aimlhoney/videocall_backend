@@ -1,9 +1,15 @@
+import * as dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
+import { PrismaPg } from '@prisma/adapter-pg';
+import pg from 'pg';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { generateRoomCode } from './utils';
+
 
 const app = express();
 const httpServer = createServer(app);
@@ -18,28 +24,70 @@ const io = new Server(httpServer, {
   },
 });
 
-const prisma = new PrismaClient();
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL!,
+});
 
-app.use(
-  cors({
-    origin: ALLOWED_ORIGINS,
-    credentials: true,
-  })
-);
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter } as any);
 
-app.options(
-  '*',
-  cors({
-    origin: ALLOWED_ORIGINS,
-    credentials: true,
-  })
-);
-
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
+app.options('*', cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
 
-/**
- * REST: Create room
- */
+// ── Helper: get today's date string ──
+const today = () => new Date().toISOString().split('T')[0];
+
+// ── Track daily visit ──
+app.post('/api/stats/visit', async (req, res) => {
+  try {
+    await prisma.dailyStat.upsert({
+      where: { date: today() },
+      update: { visitors: { increment: 1 } },
+      create: { date: today(), visitors: 1, rooms: 0, participants: 0 },
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Visit error:', error);
+    res.status(500).json({ error: 'Failed to record visit' });
+  }
+});
+
+// ── Stats summary + 7-day trend ──
+app.get('/api/stats', async (req, res) => {
+  try {
+    const [totalRooms, totalParticipants, allDailyStats, activeRooms] = await Promise.all([
+      prisma.room.count(),
+      prisma.participant.count(),
+      prisma.dailyStat.findMany({ orderBy: { date: 'asc' } }),
+      prisma.room.count({ where: { status: 'ACTIVE' } }),
+    ]);
+
+    const totalVisitors = allDailyStats.reduce((sum, d) => sum + d.visitors, 0);
+
+    // Build last 7 days trend — fill missing days with 0
+    const now = new Date();
+    const trend = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(now);
+      d.setDate(d.getDate() - (6 - i));
+      const dateStr = d.toISOString().split('T')[0];
+      const found = allDailyStats.find((s) => s.date === dateStr);
+      return {
+        date: dateStr.slice(5), // "04-19"
+        rooms: found?.rooms ?? 0,
+        participants: found?.participants ?? 0,
+        visitors: found?.visitors ?? 0,
+      };
+    });
+
+    res.json({ totalRooms, totalParticipants, totalVisitors, activeRooms, trend });
+  } catch (error) {
+    console.error('Stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// ── Create room ──
 app.post('/api/rooms', async (req, res) => {
   try {
     const { name, hostId, hostName } = req.body;
@@ -62,10 +110,15 @@ app.post('/api/rooms', async (req, res) => {
           ],
         },
       },
-      include: {
-        participants: true,
-      },
+      include: { participants: true },
     });
+
+    // Track daily room creation — non-blocking
+    prisma.dailyStat.upsert({
+      where: { date: today() },
+      update: { rooms: { increment: 1 } },
+      create: { date: today(), rooms: 1, visitors: 0, participants: 0 },
+    }).catch((e) => console.error('dailyStat room error:', e));
 
     res.json({ roomId: room.id, code });
   } catch (error) {
@@ -74,9 +127,7 @@ app.post('/api/rooms', async (req, res) => {
   }
 });
 
-/**
- * REST: Get room info
- */
+// ── Get room info ──
 app.get('/api/rooms/:code', async (req, res) => {
   try {
     const room = await prisma.room.findUnique({
@@ -84,9 +135,7 @@ app.get('/api/rooms/:code', async (req, res) => {
       include: { participants: true },
     });
 
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
+    if (!room) return res.status(404).json({ error: 'Room not found' });
 
     res.json(room);
   } catch (error) {
@@ -95,15 +144,10 @@ app.get('/api/rooms/:code', async (req, res) => {
   }
 });
 
-/**
- * Socket.io realtime handlers
- */
+// ── Socket.io ──
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  /**
-   * Join room
-   */
   socket.on(
     'join-room',
     async ({ roomCode, userId, name }: { roomCode: string; userId: string; name: string }) => {
@@ -139,19 +183,20 @@ io.on('connection', (socket) => {
               name,
               cameraOn: true,
               micOn: true,
-              // socketId is optional; add to schema if you want it
-              // socketId: socket.id,
             },
           });
+
+          // Track daily participant — non-blocking
+          prisma.dailyStat.upsert({
+            where: { date: today() },
+            update: { participants: { increment: 1 } },
+            create: { date: today(), participants: 1, rooms: 0, visitors: 0 },
+          }).catch((e) => console.error('dailyStat participant error:', e));
+
         } else {
           await prisma.participant.updateMany({
-            where: {
-              roomId: room.id,
-              userId,
-            },
-            data: {
-              // socketId: socket.id,
-            },
+            where: { roomId: room.id, userId },
+            data: {},
           });
         }
 
@@ -178,9 +223,6 @@ io.on('connection', (socket) => {
     }
   );
 
-  /**
-   * Toggle media (camera/mic)
-   */
   socket.on(
     'toggle-media',
     async ({
@@ -195,17 +237,11 @@ io.on('connection', (socket) => {
       micOn: boolean;
     }) => {
       try {
-        const room = await prisma.room.findUnique({
-          where: { code: roomCode },
-        });
-
+        const room = await prisma.room.findUnique({ where: { code: roomCode } });
         if (!room) return;
 
         await prisma.participant.updateMany({
-          where: {
-            roomId: room.id,
-            userId,
-          },
+          where: { roomId: room.id, userId },
           data: { cameraOn, micOn },
         });
 
@@ -216,19 +252,10 @@ io.on('connection', (socket) => {
     }
   );
 
-  /**
-   * Start / end meeting
-   */
   socket.on('start-meeting', async ({ roomCode }: { roomCode: string }) => {
     try {
-      const room = await prisma.room.findUnique({
-        where: { code: roomCode },
-      });
-
-      if (!room) {
-        socket.emit('error', 'Room not found');
-        return;
-      }
+      const room = await prisma.room.findUnique({ where: { code: roomCode } });
+      if (!room) { socket.emit('error', 'Room not found'); return; }
 
       await prisma.room.update({
         where: { id: room.id },
@@ -244,10 +271,7 @@ io.on('connection', (socket) => {
 
   socket.on('end-meeting', async ({ roomCode }: { roomCode: string }) => {
     try {
-      const room = await prisma.room.findUnique({
-        where: { code: roomCode },
-      });
-
+      const room = await prisma.room.findUnique({ where: { code: roomCode } });
       if (!room) return;
 
       await prisma.room.update({
@@ -261,42 +285,22 @@ io.on('connection', (socket) => {
     }
   });
 
-  /**
-   * WebRTC signaling for P2P (2 participants)
-   */
-
-  // A peer is ready and wants to establish WebRTC
   socket.on('webrtc-ready', (roomCode: string) => {
     socket.to(roomCode).emit('webrtc-ready');
   });
 
-  // Offer from caller
-  socket.on(
-    'webrtc-offer',
-    (payload: { roomCode: string; offer: any }) => {
-      socket.to(payload.roomCode).emit('webrtc-offer', payload.offer);
-    }
-  );
+  socket.on('webrtc-offer', (payload: { roomCode: string; offer: any }) => {
+    socket.to(payload.roomCode).emit('webrtc-offer', payload.offer);
+  });
 
-  // Answer from callee
-  socket.on(
-    'webrtc-answer',
-    (payload: { roomCode: string; answer: any }) => {
-      socket.to(payload.roomCode).emit('webrtc-answer', payload.answer);
-    }
-  );
+  socket.on('webrtc-answer', (payload: { roomCode: string; answer: any }) => {
+    socket.to(payload.roomCode).emit('webrtc-answer', payload.answer);
+  });
 
-  // ICE candidates
-  socket.on(
-    'webrtc-ice-candidate',
-    (payload: { roomCode: string; candidate: any }) => {
-      socket.to(payload.roomCode).emit('webrtc-ice-candidate', payload.candidate);
-    }
-  );
+  socket.on('webrtc-ice-candidate', (payload: { roomCode: string; candidate: any }) => {
+    socket.to(payload.roomCode).emit('webrtc-ice-candidate', payload.candidate);
+  });
 
-  /**
-   * Disconnect cleanup
-   */
   socket.on('disconnect', async () => {
     try {
       const roomCode = socket.data.roomCode as string | undefined;
@@ -314,10 +318,7 @@ io.on('connection', (socket) => {
       if (!room) return;
 
       await prisma.participant.deleteMany({
-        where: {
-          roomId: room.id,
-          userId,
-        },
+        where: { roomId: room.id, userId },
       });
 
       const updatedRoom = await prisma.room.findUnique({
